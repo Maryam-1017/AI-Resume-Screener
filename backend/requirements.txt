@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+python-multipart
+pymupdf
+openai
+httpx
+reportlab
+python-dotenv
+pydantic
