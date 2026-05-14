@@ -8,10 +8,6 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 
-from fastapi.middleware.cors import CORSMiddleware
-
-
-
 load_dotenv()
 
 _REQUIRED_ENV = ("OPENAI_API_KEY",)
