@@ -1,70 +1,413 @@
+import io
+import tempfile
+from datetime import date
 from pathlib import Path
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.units import cm
+
 from reportlab.lib import colors
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib.enums import TA_CENTER, TA_LEFT
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import cm, mm
+from reportlab.platypus import (
+    BaseDocTemplate,
+    Frame,
+    PageTemplate,
+    Paragraph,
+    Spacer,
+    Table,
+    TableStyle,
+)
+from reportlab.platypus.flowables import Flowable
+
 from models import ScreeningResult
 
+# ---------------------------------------------------------------------------
+# Palette
+# ---------------------------------------------------------------------------
+_INDIGO = colors.HexColor("#4F46E5")
+_INDIGO_LIGHT = colors.HexColor("#EEF2FF")
+_GREEN = colors.HexColor("#16a34a")
+_GREEN_LIGHT = colors.HexColor("#dcfce7")
+_AMBER = colors.HexColor("#d97706")
+_AMBER_LIGHT = colors.HexColor("#fef9c3")
+_RED = colors.HexColor("#dc2626")
+_RED_LIGHT = colors.HexColor("#fee2e2")
+_GREY_BG = colors.HexColor("#f9fafb")
+_GREY_BORDER = colors.HexColor("#e5e7eb")
+_TEXT_DARK = colors.HexColor("#111827")
+_TEXT_MID = colors.HexColor("#374151")
 
-def generate_report(result: ScreeningResult, output_dir: str = "reports") -> str:
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
-    safe_name = result.candidate_name.replace(" ", "_")
-    output_path = str(Path(output_dir) / f"{safe_name}_report.pdf")
+_REC_COLORS = {
+    "hire":  (_GREEN,  _GREEN_LIGHT),
+    "maybe": (_AMBER,  _AMBER_LIGHT),
+    "pass":  (_RED,    _RED_LIGHT),
+}
+_SCORE_COLOR = {
+    range(1, 5):  _RED,
+    range(5, 7):  _AMBER,
+    range(7, 11): _GREEN,
+}
 
-    doc = SimpleDocTemplate(output_path, pagesize=A4, topMargin=2 * cm, bottomMargin=2 * cm)
-    styles = getSampleStyleSheet()
-    story = []
+PAGE_W, PAGE_H = A4
+MARGIN = 2 * cm
+CONTENT_W = PAGE_W - 2 * MARGIN
 
-    title_style = ParagraphStyle("Title", parent=styles["Title"], fontSize=20, spaceAfter=12)
-    story.append(Paragraph("Resume Screening Report", title_style))
-    story.append(Spacer(1, 0.5 * cm))
 
-    info_data = [
-        ["Candidate", result.candidate_name],
-        ["Email", result.email or "N/A"],
-        ["Overall Score", f"{result.score.overall_score:.1f} / 10"],
+# ---------------------------------------------------------------------------
+# Custom flowables
+# ---------------------------------------------------------------------------
+
+class _ScoreBar(Flowable):
+    """Horizontal bar that fills proportionally to score/10."""
+
+    HEIGHT = 10 * mm
+    RADIUS = 4
+
+    def __init__(self, score: int, width: float = CONTENT_W):
+        super().__init__()
+        self.score = score
+        self.width = width
+        self.height = self.HEIGHT
+
+    def _score_color(self) -> colors.Color:
+        for r, c in _SCORE_COLOR.items():
+            if self.score in r:
+                return c
+        return _GREY_BORDER
+
+    def draw(self):
+        c = self.canv
+        bar_color = self._score_color()
+        fill_w = self.width * (self.score / 10)
+
+        # Track (background)
+        c.setFillColor(_GREY_BORDER)
+        c.roundRect(0, 0, self.width, self.HEIGHT, self.RADIUS, fill=1, stroke=0)
+
+        # Fill
+        c.setFillColor(bar_color)
+        c.roundRect(0, 0, fill_w, self.HEIGHT, self.RADIUS, fill=1, stroke=0)
+
+        # Score label centred on the bar
+        c.setFillColor(colors.white)
+        c.setFont("Helvetica-Bold", 9)
+        label = f"{self.score}/10"
+        c.drawCentredString(fill_w / 2, (self.HEIGHT - 9) / 2 + 1, label)
+
+
+class _RecommendationBadge(Flowable):
+    """A pill-shaped coloured badge for HIRE / MAYBE / PASS."""
+
+    PAD_H = 6 * mm
+    PAD_V = 3 * mm
+    RADIUS = 5
+
+    def __init__(self, recommendation: str):
+        super().__init__()
+        self.label = recommendation.upper()
+        fg, bg = _REC_COLORS.get(recommendation, (colors.grey, _GREY_BG))
+        self.fg = fg
+        self.bg = bg
+        # Fixed size — centred in content width
+        self.width = CONTENT_W
+        self.height = 14 * mm
+
+    def draw(self):
+        c = self.canv
+        badge_w = 6 * cm
+        badge_h = 12 * mm
+        x = (CONTENT_W - badge_w) / 2
+        y = (self.height - badge_h) / 2
+
+        c.setFillColor(self.bg)
+        c.roundRect(x, y, badge_w, badge_h, self.RADIUS, fill=1, stroke=0)
+
+        c.setStrokeColor(self.fg)
+        c.setLineWidth(1.5)
+        c.roundRect(x, y, badge_w, badge_h, self.RADIUS, fill=0, stroke=1)
+
+        c.setFillColor(self.fg)
+        c.setFont("Helvetica-Bold", 16)
+        c.drawCentredString(CONTENT_W / 2, y + (badge_h - 16) / 2 + 1, self.label)
+
+
+# ---------------------------------------------------------------------------
+# Page template with header rule and footer
+# ---------------------------------------------------------------------------
+
+def _make_doc(buffer: io.BytesIO) -> BaseDocTemplate:
+    def _add_chrome(canvas, doc):
+        canvas.saveState()
+
+        # Top rule
+        canvas.setStrokeColor(_INDIGO)
+        canvas.setLineWidth(3)
+        canvas.line(MARGIN, PAGE_H - MARGIN + 4 * mm, PAGE_W - MARGIN, PAGE_H - MARGIN + 4 * mm)
+
+        # Footer
+        canvas.setFont("Helvetica", 8)
+        canvas.setFillColor(colors.HexColor("#9ca3af"))
+        canvas.drawCentredString(PAGE_W / 2, MARGIN - 8 * mm, "Generated by AI Resume Screener")
+        canvas.drawRightString(
+            PAGE_W - MARGIN,
+            MARGIN - 8 * mm,
+            f"Page {doc.page}",
+        )
+
+        canvas.restoreState()
+
+    doc = BaseDocTemplate(
+        buffer,
+        pagesize=A4,
+        topMargin=MARGIN,
+        bottomMargin=MARGIN,
+        leftMargin=MARGIN,
+        rightMargin=MARGIN,
+    )
+    frame = Frame(MARGIN, MARGIN, CONTENT_W, PAGE_H - 2 * MARGIN, id="main")
+    doc.addPageTemplates([PageTemplate(id="main", frames=[frame], onPage=_add_chrome)])
+    return doc
+
+
+# ---------------------------------------------------------------------------
+# Style registry
+# ---------------------------------------------------------------------------
+
+def _styles() -> dict[str, ParagraphStyle]:
+    base = getSampleStyleSheet()
+    return {
+        "report_title": ParagraphStyle(
+            "ReportTitle",
+            fontName="Helvetica-Bold",
+            fontSize=22,
+            textColor=_INDIGO,
+            spaceAfter=2,
+            alignment=TA_LEFT,
+        ),
+        "subtitle": ParagraphStyle(
+            "Subtitle",
+            fontName="Helvetica",
+            fontSize=11,
+            textColor=_TEXT_MID,
+            spaceAfter=0,
+            alignment=TA_LEFT,
+        ),
+        "section_heading": ParagraphStyle(
+            "SectionHeading",
+            fontName="Helvetica-Bold",
+            fontSize=11,
+            textColor=_INDIGO,
+            spaceBefore=10,
+            spaceAfter=4,
+            borderPad=(0, 0, 2, 0),
+        ),
+        "body": ParagraphStyle(
+            "Body",
+            parent=base["BodyText"],
+            fontName="Helvetica",
+            fontSize=10,
+            textColor=_TEXT_DARK,
+            leading=15,
+        ),
+        "bullet": ParagraphStyle(
+            "Bullet",
+            fontName="Helvetica",
+            fontSize=10,
+            textColor=_TEXT_DARK,
+            leading=15,
+            leftIndent=6,
+            firstLineIndent=0,
+            bulletIndent=0,
+        ),
+        "score_label": ParagraphStyle(
+            "ScoreLabel",
+            fontName="Helvetica-Bold",
+            fontSize=28,
+            textColor=_TEXT_DARK,
+            alignment=TA_CENTER,
+            spaceAfter=4,
+        ),
+        "col_header": ParagraphStyle(
+            "ColHeader",
+            fontName="Helvetica-Bold",
+            fontSize=10,
+            textColor=colors.white,
+            alignment=TA_CENTER,
+        ),
+        "meta_label": ParagraphStyle(
+            "MetaLabel",
+            fontName="Helvetica-Bold",
+            fontSize=9,
+            textColor=_TEXT_MID,
+        ),
+        "meta_value": ParagraphStyle(
+            "MetaValue",
+            fontName="Helvetica",
+            fontSize=9,
+            textColor=_TEXT_DARK,
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Section builders
+# ---------------------------------------------------------------------------
+
+def _header_section(result: ScreeningResult, st: dict) -> list:
+    today = date.today().strftime("%B %d, %Y")
+    return [
+        Paragraph("Hiring Recommendation Report", st["report_title"]),
+        Paragraph(f"{result.candidate_name}  ·  {today}", st["subtitle"]),
+        Spacer(1, 3 * mm),
+        _hr(),
+        Spacer(1, 4 * mm),
     ]
-    if result.github:
-        info_data.append(["GitHub", result.github.url])
-        info_data.append(["Repos", str(result.github.repo_count or "N/A")])
-        info_data.append(["Recent Activity", "Yes" if result.github.has_activity else "No"])
 
-    table = Table(info_data, colWidths=[5 * cm, 12 * cm])
+
+def _score_section(result: ScreeningResult, st: dict) -> list:
+    score_color = _RED
+    for r, c in _SCORE_COLOR.items():
+        if result.score in r:
+            score_color = c
+
+    story = [
+        Paragraph("Score", st["section_heading"]),
+        Paragraph(
+            f'<font color="#{_hex(score_color)}">{result.score}</font>'
+            f'<font color="#9ca3af">/10</font>',
+            st["score_label"],
+        ),
+        _ScoreBar(result.score),
+        Spacer(1, 4 * mm),
+    ]
+    return story
+
+
+def _badge_section(result: ScreeningResult) -> list:
+    return [
+        _RecommendationBadge(result.recommendation),
+        Spacer(1, 4 * mm),
+    ]
+
+
+def _meta_row(label: str, value: str, st: dict) -> Table:
+    t = Table(
+        [[Paragraph(label, st["meta_label"]), Paragraph(value, st["meta_value"])]],
+        colWidths=[4 * cm, CONTENT_W - 4 * cm],
+    )
+    t.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("PADDING", (0, 0), (-1, -1), 3),
+    ]))
+    return t
+
+
+def _meta_section(result: ScreeningResult, st: dict) -> list:
+    match_label = {"strong": "Strong ✓", "partial": "Partial ~", "weak": "Weak ✗"}.get(
+        result.experience_match, result.experience_match
+    )
+    rows = [
+        Paragraph("Details", st["section_heading"]),
+        _meta_row("Experience Match", match_label, st),
+    ]
+
+    if result.github_check:
+        gh = result.github_check
+        status = "Verified" if gh.exists else "Not found"
+        rows.append(_meta_row("GitHub Profile", f"{gh.url}  ({status})", st))
+        if gh.repo_count is not None:
+            rows.append(_meta_row("Public Repos", str(gh.repo_count), st))
+        if gh.top_languages:
+            rows.append(_meta_row("Top Languages", ",  ".join(gh.top_languages), st))
+
+    rows.append(Spacer(1, 3 * mm))
+    return rows
+
+
+def _strengths_gaps_section(result: ScreeningResult, st: dict) -> list:
+    col_w = (CONTENT_W - 3 * mm) / 2
+
+    def _bullet_cells(items: list[str]) -> list[Paragraph]:
+        return [Paragraph(f"• {item}", st["bullet"]) for item in items]
+
+    header_row = [
+        Paragraph("Strengths", st["col_header"]),
+        Paragraph("Gaps", st["col_header"]),
+    ]
+    content_rows = list(zip(_bullet_cells(result.strengths), _bullet_cells(result.gaps)))
+
+    table = Table([header_row, *content_rows], colWidths=[col_w, col_w], spaceBefore=2)
     table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (0, -1), colors.lightgrey),
-        ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
-        ("FONTSIZE", (0, 0), (-1, -1), 10),
-        ("ROWBACKGROUNDS", (0, 0), (-1, -1), [colors.whitesmoke, colors.white]),
-        ("BOX", (0, 0), (-1, -1), 0.5, colors.grey),
-        ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.grey),
-        ("PADDING", (0, 0), (-1, -1), 6),
+        ("BACKGROUND", (0, 0), (-1, 0), _INDIGO),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [_GREY_BG, colors.white]),
+        ("BOX", (0, 0), (-1, -1), 0.5, _GREY_BORDER),
+        ("INNERGRID", (0, 0), (-1, -1), 0.25, _GREY_BORDER),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("PADDING", (0, 0), (-1, -1), 7),
+        ("LINEAFTER", (0, 0), (0, -1), 0.5, _GREY_BORDER),
     ]))
-    story.append(table)
-    story.append(Spacer(1, 0.8 * cm))
 
-    story.append(Paragraph("Score Breakdown", styles["Heading2"]))
-    score_data = [
-        ["Category", "Score"],
-        ["Skills", f"{result.score.skills_score:.1f}"],
-        ["Experience", f"{result.score.experience_score:.1f}"],
-        ["Education", f"{result.score.education_score:.1f}"],
+    return [
+        Paragraph("Strengths &amp; Gaps", st["section_heading"]),
+        table,
+        Spacer(1, 4 * mm),
     ]
-    score_table = Table(score_data, colWidths=[8 * cm, 4 * cm])
-    score_table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4F46E5")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
-        ("ALIGN", (1, 0), (1, -1), "CENTER"),
-        ("BOX", (0, 0), (-1, -1), 0.5, colors.grey),
-        ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.grey),
-        ("PADDING", (0, 0), (-1, -1), 6),
-    ]))
-    story.append(score_table)
-    story.append(Spacer(1, 0.8 * cm))
 
-    story.append(Paragraph("Feedback", styles["Heading2"]))
-    story.append(Paragraph(result.score.feedback, styles["BodyText"]))
+
+def _summary_section(result: ScreeningResult, st: dict) -> list:
+    return [
+        Paragraph("Summary", st["section_heading"]),
+        Paragraph(result.summary, st["body"]),
+        Spacer(1, 3 * mm),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+
+def _hr() -> Table:
+    """Full-width horizontal rule."""
+    t = Table([[""]], colWidths=[CONTENT_W])
+    t.setStyle(TableStyle([
+        ("LINEBELOW", (0, 0), (-1, -1), 0.5, _GREY_BORDER),
+        ("TOPPADDING", (0, 0), (-1, -1), 0),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+    ]))
+    return t
+
+
+def _hex(color: colors.Color) -> str:
+    """Return 6-char hex string (without #) for a ReportLab Color."""
+    return "{:02x}{:02x}{:02x}".format(
+        int(color.red * 255),
+        int(color.green * 255),
+        int(color.blue * 255),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def generate_pdf_report(result: ScreeningResult) -> bytes:
+    """
+    Render a ScreeningResult to a PDF and return the raw bytes.
+
+    Uses an in-memory buffer — no temp files are left on disk.
+    The caller (main.py) is responsible for writing or streaming the bytes.
+    """
+    buffer = io.BytesIO()
+    doc = _make_doc(buffer)
+    st = _styles()
+
+    story: list = []
+    story += _header_section(result, st)
+    story += _score_section(result, st)
+    story += _badge_section(result)
+    story += _strengths_gaps_section(result, st)
+    story += _meta_section(result, st)
+    story += _summary_section(result, st)
 
     doc.build(story)
-    return output_path
+    return buffer.getvalue()
