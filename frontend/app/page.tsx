@@ -20,7 +20,7 @@ type Phase = 'idle' | 'loading' | 'result' | 'error'
 type Tab = 'single' | 'batch'
 
 // ─── Constants ───────────────────────────────────────────────────────────────
-const API = 'http://localhost:8000'
+const API = (process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000').replace(/\/$/, '')
 const STEPS = ['Parsing résumé…', 'Analyzing candidate fit…', 'Verifying GitHub…', 'Generating report…']
 
 const REC = {
