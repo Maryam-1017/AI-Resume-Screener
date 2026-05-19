@@ -5,7 +5,13 @@ import os
 from openai import AsyncOpenAI, APIError, APITimeoutError, RateLimitError
 
 from models import BatchScreeningResult, ScreeningRequest, ScreeningResult
-from prompts import SYSTEM_PROMPT, build_screening_prompt, parse_llm_response
+from prompts import (
+    SYSTEM_PROMPT,
+    build_comparison_prompt,
+    build_screening_prompt,
+    parse_comparison_response,
+    parse_llm_response,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -20,12 +26,12 @@ _client = AsyncOpenAI(
 )
 
 
-async def _call_llm(user_prompt: str) -> str:
+async def _call_llm(user_prompt: str, temperature: float = _TEMPERATURE) -> str:
     """Send a single chat completion request and return the raw content string."""
     try:
         response = await _client.chat.completions.create(
             model=_MODEL,
-            temperature=_TEMPERATURE,
+            temperature=temperature,
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
@@ -41,8 +47,24 @@ async def _call_llm(user_prompt: str) -> str:
 
     content = response.choices[0].message.content
     if not content:
-        raise ValueError("OpenAI returned an empty response body.")
+        raise ValueError("LLM returned an empty response body.")
     return content
+
+
+async def run_comparison(job_description: str, candidates: list[dict]) -> dict:
+    """
+    Call the LLM comparison pass and return the validated raw dict.
+
+    Uses temperature=0.3 (slightly higher than screening) to allow the model
+    more flexibility in constructing the narrative hiring memo while keeping
+    structured fields consistent.
+
+    Raises ValueError / RuntimeError — callers must handle these and decide
+    whether to surface them or degrade gracefully.
+    """
+    prompt = build_comparison_prompt(job_description, candidates)
+    raw = await _call_llm(prompt, temperature=0.3)
+    return parse_comparison_response(raw)
 
 
 async def screen_candidate(request: ScreeningRequest) -> ScreeningResult:

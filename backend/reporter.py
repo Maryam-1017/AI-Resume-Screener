@@ -1,5 +1,4 @@
 import io
-import tempfile
 from datetime import date
 from pathlib import Path
 
@@ -11,6 +10,8 @@ from reportlab.lib.units import cm, mm
 from reportlab.platypus import (
     BaseDocTemplate,
     Frame,
+    KeepTogether,
+    PageBreak,
     PageTemplate,
     Paragraph,
     Spacer,
@@ -19,7 +20,7 @@ from reportlab.platypus import (
 )
 from reportlab.platypus.flowables import Flowable
 
-from models import ScreeningResult
+from models import CompareResponse, ScreeningResult
 
 # ---------------------------------------------------------------------------
 # Palette
@@ -129,6 +130,126 @@ class _RecommendationBadge(Flowable):
         c.setFillColor(self.fg)
         c.setFont("Helvetica-Bold", 16)
         c.drawCentredString(CONTENT_W / 2, y + (badge_h - 16) / 2 + 1, self.label)
+
+
+class _HireBox(Flowable):
+    """Full-width green box: '✓ RECOMMENDED HIRE' label + large candidate name."""
+
+    RADIUS = 8
+
+    def __init__(self, name: str, width: float = CONTENT_W):
+        super().__init__()
+        self.name = name
+        self.width = width
+        self.height = 38 * mm
+
+    def draw(self):
+        c = self.canv
+        h = self.height
+
+        # Background + border
+        c.setFillColor(_GREEN_LIGHT)
+        c.setStrokeColor(_GREEN)
+        c.setLineWidth(1.5)
+        c.roundRect(0, 0, self.width, h, self.RADIUS, fill=1, stroke=1)
+
+        # Top label
+        c.setFillColor(_GREEN)
+        c.setFont("Helvetica-Bold", 10)
+        c.drawCentredString(self.width / 2, h - 15, "✓  RECOMMENDED HIRE")
+
+        # Thin divider below label
+        c.setStrokeColor(colors.HexColor("#86efac"))
+        c.setLineWidth(0.75)
+        c.line(MARGIN, h - 20, self.width - MARGIN, h - 20)
+
+        # Candidate name — scale font down for long names
+        font_size = min(22, max(13, int(300 / max(len(self.name), 1))))
+        c.setFillColor(_TEXT_DARK)
+        c.setFont("Helvetica-Bold", font_size)
+        c.drawCentredString(self.width / 2, h / 2 - font_size / 2 - 2, self.name)
+
+
+class _PillRow(Flowable):
+    """Horizontally-wrapping row of indigo pill badges (for shortlist names)."""
+
+    PILL_H   = 8 * mm
+    PILL_PAD = 10        # horizontal text padding inside each pill
+    GAP      = 6         # gap between pills
+
+    def __init__(self, names: list[str], width: float = CONTENT_W):
+        super().__init__()
+        self.names   = names
+        self.width   = width
+        self.height  = self._compute_height()
+
+    def _pill_w(self, name: str) -> float:
+        # Helvetica 9pt ≈ 5.5pt per char; add padding on both sides
+        return max(2.5 * cm, len(name) * 5.5 + 2 * self.PILL_PAD)
+
+    def _rows(self) -> list[list[str]]:
+        rows: list[list[str]] = [[]]
+        x = 0.0
+        for name in self.names:
+            pw = self._pill_w(name)
+            if x + pw > self.width and rows[-1]:
+                rows.append([])
+                x = 0.0
+            rows[-1].append(name)
+            x += pw + self.GAP
+        return rows
+
+    def _compute_height(self) -> float:
+        r = self._rows()
+        return len(r) * (self.PILL_H + self.GAP) + 2
+
+    def draw(self):
+        c = self.canv
+        rows = self._rows()
+        y = self.height - self.PILL_H - 1
+        for row in rows:
+            x = 0.0
+            for name in row:
+                pw = self._pill_w(name)
+                c.setFillColor(_INDIGO_LIGHT)
+                c.setStrokeColor(_INDIGO)
+                c.setLineWidth(1)
+                c.roundRect(x, y, pw, self.PILL_H, 4, fill=1, stroke=1)
+                c.setFillColor(_INDIGO)
+                c.setFont("Helvetica-Bold", 9)
+                c.drawCentredString(
+                    x + pw / 2,
+                    y + (self.PILL_H - 9) / 2 + 1,
+                    name,
+                )
+                x += pw + self.GAP
+            y -= self.PILL_H + self.GAP
+
+
+class _WarningHeader(Flowable):
+    """Amber warning banner used as the red-flags page title."""
+
+    RADIUS = 6
+
+    def __init__(self, text: str, width: float = CONTENT_W):
+        super().__init__()
+        self.text  = text
+        self.width = width
+        self.height = 14 * mm
+
+    def draw(self):
+        c = self.canv
+        c.setFillColor(_AMBER_LIGHT)
+        c.setStrokeColor(_AMBER)
+        c.setLineWidth(1.5)
+        c.roundRect(0, 0, self.width, self.height, self.RADIUS, fill=1, stroke=1)
+        c.setFillColor(_AMBER)
+        c.setFont("Helvetica-Bold", 11)
+        c.drawCentredString(
+            self.width / 2,
+            (self.height - 11) / 2 + 1,
+            f"⚠  {self.text}",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -363,6 +484,59 @@ def _summary_section(result: ScreeningResult, st: dict) -> list:
 
 
 # ---------------------------------------------------------------------------
+# Comparison helpers
+# ---------------------------------------------------------------------------
+
+def _score_color_for(score: int) -> colors.Color:
+    for r, c in _SCORE_COLOR.items():
+        if score in r:
+            return c
+    return _GREY_BORDER
+
+
+def _callout_box(rank_a: int, name_a: str, rank_b: int, name_b: str, reason: str) -> Table:
+    """
+    Indented callout box: '#{rank_a} beats #{rank_b}' with the reason text.
+    Returns a two-column Table whose left cell provides the 2cm left indent.
+    """
+    title_st = ParagraphStyle(
+        "CBTitle", fontName="Helvetica-Bold", fontSize=9,
+        textColor=_INDIGO, spaceAfter=2,
+    )
+    body_st = ParagraphStyle(
+        "CBBody", fontName="Helvetica", fontSize=9,
+        textColor=_TEXT_DARK, leading=13,
+    )
+    inner_w = CONTENT_W - 2 * cm
+    inner = Table(
+        [
+            [Paragraph(f"Why #{rank_a} beats #{rank_b}", title_st)],
+            [Paragraph(
+                f"<b>{name_a}</b> edges out <b>{name_b}</b>: {reason}",
+                body_st,
+            )],
+        ],
+        colWidths=[inner_w],
+    )
+    inner.setStyle(TableStyle([
+        ("BACKGROUND",   (0, 0), (-1, -1), _INDIGO_LIGHT),
+        ("LINEBEFORE",   (0, 0), (0, -1),  3, _INDIGO),
+        ("LEFTPADDING",  (0, 0), (-1, -1), 10),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+        ("TOPPADDING",   (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING",(0, 0), (-1, -1), 6),
+        ("VALIGN",       (0, 0), (-1, -1), "TOP"),
+    ]))
+    # Outer table adds the left indent
+    outer = Table([["", inner]], colWidths=[2 * cm, inner_w])
+    outer.setStyle(TableStyle([
+        ("PADDING",  (0, 0), (-1, -1), 0),
+        ("VALIGN",   (0, 0), (-1, -1), "TOP"),
+    ]))
+    return outer
+
+
+# ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
 
@@ -389,6 +563,204 @@ def _hex(color: colors.Color) -> str:
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
+def generate_comparison_report(response: CompareResponse) -> bytes:
+    """
+    Render a CompareResponse to a multi-page PDF and return raw bytes.
+
+    Page 1 — Executive Summary: recommended hire box, shortlist pills, memo.
+    Page 2 — Candidate Rankings: scored table + "Why #N beats #N+1" callouts.
+    Page 3 — Red Flags (omitted when red_flags is empty).
+    """
+    buffer = io.BytesIO()
+    doc    = _make_doc(buffer)
+    st     = _styles()
+    cmp    = response.comparison
+    today  = date.today().strftime("%B %d, %Y")
+
+    # Build case-insensitive name → (score, first_gap) lookup from individual results.
+    # Names may differ between the two LLM passes, so best-effort matching is intentional.
+    _score_lookup: dict[str, int] = {}
+    _gap_lookup:   dict[str, str] = {}
+    for r in response.individual_results:
+        key = r.candidate_name.lower()
+        _score_lookup[key] = r.score
+        _gap_lookup[key]   = r.gaps[0] if r.gaps else "—"
+
+    def _lookup_score(name: str) -> int | None:
+        return _score_lookup.get(name.lower())
+
+    def _lookup_gap(name: str) -> str:
+        return _gap_lookup.get(name.lower(), "—")
+
+    sorted_ranking = sorted(cmp.ranking, key=lambda e: e.rank)
+    story: list = []
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # PAGE 1 — Executive Summary
+    # ═══════════════════════════════════════════════════════════════════════
+
+    story.append(Paragraph("Hiring Decision Report", st["report_title"]))
+    story.append(Paragraph(
+        f"{today}  ·  {cmp.total_candidates} candidates  ·  {cmp.job_description_summary}",
+        st["subtitle"],
+    ))
+    story.append(Spacer(1, 3 * mm))
+    story.append(_hr())
+    story.append(Spacer(1, 6 * mm))
+
+    # Recommended hire — large green box
+    story.append(_HireBox(cmp.recommended_hire))
+    story.append(Spacer(1, 6 * mm))
+
+    # Shortlist pill badges
+    if cmp.panel_interview_shortlist:
+        story.append(Paragraph("Panel Interview Shortlist", st["section_heading"]))
+        story.append(Spacer(1, 2 * mm))
+        story.append(_PillRow(cmp.panel_interview_shortlist))
+        story.append(Spacer(1, 6 * mm))
+
+    # Hiring memo
+    story.append(Paragraph("Hiring Memo", st["section_heading"]))
+    story.append(Paragraph(cmp.hiring_memo, st["body"]))
+
+    story.append(PageBreak())
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # PAGE 2 — Candidate Rankings
+    # ═══════════════════════════════════════════════════════════════════════
+
+    story.append(Paragraph("Candidate Rankings", st["report_title"]))
+    story.append(Spacer(1, 3 * mm))
+    story.append(_hr())
+    story.append(Spacer(1, 6 * mm))
+
+    # Column widths: Rank | Candidate | Score | Verdict | Key Gap = CONTENT_W
+    _CW = [1.2 * cm, 4.2 * cm, 2.2 * cm, 5.2 * cm, 4.2 * cm]
+
+    score_col_st = ParagraphStyle(
+        "ScoreCell", fontName="Helvetica-Bold", fontSize=10,
+        alignment=TA_CENTER, textColor=_TEXT_DARK,
+    )
+
+    header_row = [
+        Paragraph("Rank",      st["col_header"]),
+        Paragraph("Candidate", st["col_header"]),
+        Paragraph("Score",     st["col_header"]),
+        Paragraph("Verdict",   st["col_header"]),
+        Paragraph("Key Gap",   st["col_header"]),
+    ]
+    rank_rows = [header_row]
+    for entry in sorted_ranking:
+        score = _lookup_score(entry.name)
+        if score is not None:
+            sc = _score_color_for(score)
+            score_cell = Paragraph(
+                f'<font color="#{_hex(sc)}"><b>{score}/10</b></font>',
+                score_col_st,
+            )
+        else:
+            score_cell = Paragraph("—", score_col_st)
+
+        rank_rows.append([
+            Paragraph(str(entry.rank),          st["body"]),
+            Paragraph(entry.name,               st["body"]),
+            score_cell,
+            Paragraph(entry.one_line_verdict,   st["body"]),
+            Paragraph(_lookup_gap(entry.name),  st["body"]),
+        ])
+
+    rank_table = Table(rank_rows, colWidths=_CW)
+    ts = TableStyle([
+        # Header row
+        ("BACKGROUND",    (0, 0), (-1, 0),  _INDIGO),
+        ("TEXTCOLOR",     (0, 0), (-1, 0),  colors.white),
+        # Rank-1 row gets a green tint
+        ("BACKGROUND",    (0, 1), (-1, 1),  _GREEN_LIGHT),
+        # Remaining rows alternate
+        ("ROWBACKGROUNDS",(0, 2), (-1, -1), [colors.white, _GREY_BG]),
+        # Borders
+        ("BOX",           (0, 0), (-1, -1), 0.5, _GREY_BORDER),
+        ("INNERGRID",     (0, 0), (-1, -1), 0.25, _GREY_BORDER),
+        ("VALIGN",        (0, 0), (-1, -1), "TOP"),
+        ("ALIGN",         (0, 0), (0, -1),  "CENTER"),   # rank col centred
+        ("ALIGN",         (2, 0), (2, -1),  "CENTER"),   # score col centred
+        ("PADDING",       (0, 0), (-1, -1), 6),
+    ])
+    rank_table.setStyle(ts)
+    story.append(rank_table)
+    story.append(Spacer(1, 6 * mm))
+
+    # "Why #N beats #N+1" callout boxes for each consecutive pair
+    callouts: list = []
+    for i in range(len(sorted_ranking) - 1):
+        a = sorted_ranking[i]
+        b = sorted_ranking[i + 1]
+        if a.beats_next_because:
+            callouts.append(
+                KeepTogether([
+                    _callout_box(a.rank, a.name, b.rank, b.name, a.beats_next_because),
+                    Spacer(1, 3 * mm),
+                ])
+            )
+    story.extend(callouts)
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # PAGE 3 — Red Flags  (only when non-empty)
+    # ═══════════════════════════════════════════════════════════════════════
+
+    if cmp.red_flags:
+        story.append(PageBreak())
+
+        story.append(_WarningHeader("Red Flags — Review Carefully Before Proceeding"))
+        story.append(Spacer(1, 6 * mm))
+
+        flag_st = ParagraphStyle(
+            "FlagBody", fontName="Helvetica", fontSize=10,
+            textColor=_TEXT_DARK, leading=15, spaceAfter=4,
+        )
+        name_st = ParagraphStyle(
+            "FlagName", fontName="Helvetica-Bold", fontSize=10,
+            textColor=colors.HexColor("#92400e"),   # amber-900
+        )
+
+        for candidate, flag in cmp.red_flags.items():
+            flag_rows = [
+                [
+                    Paragraph(candidate, name_st),
+                    Paragraph(flag,      flag_st),
+                ]
+            ]
+            flag_table = Table(flag_rows, colWidths=[4.5 * cm, CONTENT_W - 4.5 * cm])
+            flag_table.setStyle(TableStyle([
+                ("BACKGROUND",    (0, 0), (-1, -1), _AMBER_LIGHT),
+                ("BOX",           (0, 0), (-1, -1), 0.75, _AMBER),
+                ("LINEBEFORE",    (0, 0), (0, -1),  4, _AMBER),
+                ("LEFTPADDING",   (0, 0), (-1, -1), 10),
+                ("RIGHTPADDING",  (0, 0), (-1, -1), 8),
+                ("TOPPADDING",    (0, 0), (-1, -1), 6),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                ("VALIGN",        (0, 0), (-1, -1), "TOP"),
+            ]))
+            story.append(flag_table)
+            story.append(Spacer(1, 3 * mm))
+
+        story.append(Spacer(1, 8 * mm))
+        story.append(_hr())
+        story.append(Spacer(1, 3 * mm))
+        story.append(Paragraph(
+            "Red flags are generated by an AI language model and reflect information "
+            "present in the résumé text. They should be independently verified by a "
+            "human recruiter before being used in any hiring decision.",
+            ParagraphStyle(
+                "Disclaimer", fontName="Helvetica-Oblique", fontSize=8,
+                textColor=colors.HexColor("#6b7280"), leading=12,
+            ),
+        ))
+
+    doc.build(story)
+    return buffer.getvalue()
+
 
 def generate_pdf_report(result: ScreeningResult) -> bytes:
     """

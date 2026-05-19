@@ -1,12 +1,14 @@
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import JSONResponse, Response
 
 load_dotenv()
 
@@ -21,10 +23,17 @@ def _check_required_env() -> None:
             "Copy .env.example → .env and fill in the values before starting the server."
         )
 
-from models import BatchScreeningResult, ScreeningRequest, ScreeningResult
+from models import (
+    BatchScreeningResult,
+    CandidateRanking,
+    CompareResponse,
+    ComparisonResult,
+    ScreeningRequest,
+    ScreeningResult,
+)
 from parser import extract_resume_text
-from reporter import generate_pdf_report
-from screener import batch_screen, screen_candidate
+from reporter import generate_comparison_report, generate_pdf_report
+from screener import batch_screen, run_comparison, screen_candidate
 from verifier import verify_github
 
 logger = logging.getLogger(__name__)
@@ -251,13 +260,171 @@ async def download_report(candidate_name: str):
         media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
-    app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # replace later with Vercel domain
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+
+
+# ---------------------------------------------------------------------------
+# Comparison endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/compare", tags=["Comparison"])
+async def compare_resumes(
+    job_description: str = Form(..., min_length=10, description="Full job posting text."),
+    pdf_files: list[UploadFile] = File(..., description="2–10 candidate résumé PDFs."),
+):
+    """
+    Screen multiple candidates individually then run a second LLM pass to
+    rank, compare, and produce a hiring memo.
+
+    The comparison LLM call is best-effort: if it fails, individual_results
+    are still returned with comparison=null and a warning field so the caller
+    always gets usable data.
+    """
+    # ── 1. Validate file count ────────────────────────────────────────────────
+    n = len(pdf_files)
+    if n < 2 or n > 10:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Comparison requires 2–10 résumés",
+        )
+
+    # ── 2. Parse all PDFs concurrently ───────────────────────────────────────
+    async def _read_and_parse(upload: UploadFile) -> dict:
+        file_bytes = await upload.read()
+        filename = (upload.filename or "").strip()
+        # extract_resume_text is CPU-bound; run it in the thread pool so
+        # multiple files are parsed in parallel without blocking the event loop.
+        parsed = await asyncio.to_thread(extract_resume_text, file_bytes, filename)
+        parsed["_filename"] = filename
+        return parsed
+
+    raw_parse_results = await asyncio.gather(
+        *[_read_and_parse(f) for f in pdf_files],
+        return_exceptions=True,
+    )
+
+    # Separate successes from per-file failures (skip failed files, keep going)
+    parsed_files: list[dict] = []
+    for upload, outcome in zip(pdf_files, raw_parse_results):
+        if isinstance(outcome, Exception):
+            logger.warning("Skipping '%s': %s", upload.filename, outcome)
+        else:
+            parsed_files.append(outcome)
+
+    if len(parsed_files) < 2:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"At least 2 résumés must be parseable. "
+                f"Only {len(parsed_files)} of {n} file(s) could be read."
+            ),
+        )
+
+    # ── 3. Batch-screen all parsed résumés ───────────────────────────────────
+    resumes = [
+        {
+            "name": Path(p["_filename"]).stem or f"Candidate {i + 1}",
+            "text": p["full_text"],
+        }
+        for i, p in enumerate(parsed_files)
+    ]
+
+    try:
+        batch_result = await batch_screen(job_description, resumes)
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc))
+
+    individual_results: list[ScreeningResult] = list(batch_result.results)
+
+    # Cache each result so /report/{name} still works after a compare call
+    for r in individual_results:
+        _report_cache[r.candidate_name] = r
+
+    # ── 4. Build candidates payload for comparison prompt ────────────────────
+    candidates = [
+        {
+            "name": r.candidate_name,
+            "score": r.score,
+            "strengths": r.strengths,
+            "gaps": r.gaps,
+            "recommendation": r.recommendation,
+            "experience_match": r.experience_match,
+            "summary": r.summary,
+        }
+        for r in individual_results
+    ]
+
+    screened_at = datetime.now(timezone.utc).isoformat()
+
+    # ── 5–8. Comparison LLM call (best-effort — never crashes endpoint) ───────
+    comparison: ComparisonResult | None = None
+    warning: str | None = None
+    try:
+        comparison_data = await run_comparison(job_description, candidates)
+
+        # Inject total_candidates (not returned by LLM; derived here)
+        comparison_data["total_candidates"] = len(individual_results)
+
+        # Pydantic coerces the nested ranking dicts → CandidateRanking objects
+        comparison = ComparisonResult(**comparison_data)
+
+        logger.info(
+            "Comparison complete — recommended hire: %s | shortlist: %s",
+            comparison.recommended_hire,
+            comparison.panel_interview_shortlist,
+        )
+
+    except Exception as exc:
+        warning = (
+            f"Comparison analysis could not be completed: {exc}. "
+            "Individual screening results are still available."
+        )
+        logger.warning("Comparison LLM call failed: %s", exc)
+
+    # ── 9. Return — full CompareResponse on success, partial dict on failure ──
+    if comparison is not None:
+        return CompareResponse(
+            individual_results=individual_results,
+            comparison=comparison,
+            screened_at=screened_at,
+        )
+
+    # Graceful degradation: return parseable JSON even when comparison failed
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content={
+            "individual_results": [r.model_dump() for r in individual_results],
+            "comparison": None,
+            "screened_at": screened_at,
+            "warning": warning,
+        },
+    )
+
+
+@app.post("/compare/report", tags=["Comparison"])
+async def download_comparison_report(body: CompareResponse):
+    """
+    Generate and download a multi-candidate comparison PDF report.
+
+    Accepts the full CompareResponse JSON returned by POST /compare.
+    The PDF includes the ranking table, hiring memo, red flags, and
+    individual score summaries for all screened candidates.
+    """
+    try:
+        pdf_bytes = generate_comparison_report(body)
+    except Exception as exc:
+        logger.error("Comparison PDF generation failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to generate comparison PDF report.",
+        )
+
+    safe_jd = "comparison_report"
+    filename = f"{safe_jd}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 

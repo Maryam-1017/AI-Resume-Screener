@@ -10,6 +10,7 @@ Or from inside backend/:
 
 import io
 import json
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from reportlab.lib.pagesizes import A4
@@ -292,3 +293,284 @@ class TestHealthEndpoint:
     def test_method_not_allowed_for_post(self, client):
         response = client.post("/health")
         assert response.status_code == 405
+
+
+# ---------------------------------------------------------------------------
+# Comparison — prompt builder and response parser
+# ---------------------------------------------------------------------------
+
+from prompts import build_comparison_prompt, parse_comparison_response  # noqa: E402
+
+_MOCK_CANDIDATES = [
+    {
+        "name": "Alice Johnson",
+        "score": 9,
+        "strengths": ["FastAPI expertise", "System design", "Open-source work"],
+        "gaps": ["No ML", "Limited frontend", "No cloud certs"],
+        "recommendation": "hire",
+        "experience_match": "strong",
+        "summary": "Alice is a strong fit.",
+    },
+    {
+        "name": "Bob Smith",
+        "score": 6,
+        "strengths": ["Django experience", "SQL skills", "REST APIs"],
+        "gaps": ["No k8s", "No Docker", "No CI/CD"],
+        "recommendation": "maybe",
+        "experience_match": "partial",
+        "summary": "Bob is a partial fit.",
+    },
+    {
+        "name": "Carol Lee",
+        "score": 3,
+        "strengths": ["Communication", "Documentation", "Testing"],
+        "gaps": ["No backend", "No Python", "No databases"],
+        "recommendation": "pass",
+        "experience_match": "weak",
+        "summary": "Carol is not a fit for this role.",
+    },
+]
+
+_VALID_COMPARISON_PAYLOAD: dict = {
+    "recommended_hire": "Alice Johnson",
+    "job_description_summary": "Senior Python backend engineer for a fintech startup.",
+    "ranking": [
+        {
+            "rank": 1,
+            "name": "Alice Johnson",
+            "one_line_verdict": "Top candidate — strong FastAPI and system design.",
+            "beats_next_because": "Three years of FastAPI in production versus Bob's general Django.",
+        },
+        {
+            "rank": 2,
+            "name": "Bob Smith",
+            "one_line_verdict": "Solid fundamentals but limited cloud experience.",
+            "beats_next_because": "Bob has a working REST portfolio; Carol has none.",
+        },
+        {
+            "rank": 3,
+            "name": "Carol Lee",
+            "one_line_verdict": "Junior-level; not ready for a senior role.",
+            "beats_next_because": None,
+        },
+    ],
+    "panel_interview_shortlist": ["Bob Smith"],
+    "red_flags": {
+        "Carol Lee": "No backend deployments mentioned despite 4 years claimed experience."
+    },
+    "hiring_memo": (
+        "Alice Johnson is the clear hire. Her FastAPI background directly matches the JD. "
+        "Bob Smith is a reasonable backup if Alice declines. "
+        "Carol Lee requires significant upskilling before being considered."
+    ),
+}
+
+
+class TestComparison:
+    # ── Prompt builder ────────────────────────────────────────────────────────
+
+    def test_build_comparison_prompt_includes_all_candidates(self):
+        prompt = build_comparison_prompt(
+            "Senior Python engineer role.", _MOCK_CANDIDATES
+        )
+        assert "Alice Johnson" in prompt
+        assert "Bob Smith" in prompt
+        assert "Carol Lee" in prompt
+
+    def test_build_comparison_prompt_includes_scores(self):
+        prompt = build_comparison_prompt(
+            "Senior Python engineer role.", _MOCK_CANDIDATES
+        )
+        # Each score should appear somewhere in the block
+        assert "9/10" in prompt or "score: 9" in prompt
+        assert "6/10" in prompt or "score: 6" in prompt
+
+    def test_build_comparison_prompt_includes_job_description(self):
+        jd = "We need a senior Rust developer with 5+ years experience."
+        prompt = build_comparison_prompt(jd, _MOCK_CANDIDATES)
+        assert jd in prompt
+
+    def test_build_comparison_prompt_empty_job_raises(self):
+        with pytest.raises(ValueError, match="job_desc"):
+            build_comparison_prompt("", _MOCK_CANDIDATES)
+
+    def test_build_comparison_prompt_empty_candidates_raises(self):
+        with pytest.raises(ValueError, match="candidates"):
+            build_comparison_prompt("Senior engineer.", [])
+
+    # ── Response parser — happy paths ─────────────────────────────────────────
+
+    def test_parse_comparison_response_happy_path(self):
+        raw = json.dumps(_VALID_COMPARISON_PAYLOAD)
+        result = parse_comparison_response(raw)
+
+        assert result["recommended_hire"] == "Alice Johnson"
+        assert result["job_description_summary"] == _VALID_COMPARISON_PAYLOAD["job_description_summary"]
+        assert len(result["ranking"]) == 3
+        assert result["ranking"][0]["rank"] == 1
+        assert result["ranking"][0]["name"] == "Alice Johnson"
+        assert result["ranking"][2]["beats_next_because"] is None
+        assert result["panel_interview_shortlist"] == ["Bob Smith"]
+        assert "Carol Lee" in result["red_flags"]
+        assert isinstance(result["hiring_memo"], str)
+
+    def test_parse_comparison_response_markdown_fences(self):
+        wrapped = f"```json\n{json.dumps(_VALID_COMPARISON_PAYLOAD)}\n```"
+        result = parse_comparison_response(wrapped)
+        assert result["recommended_hire"] == "Alice Johnson"
+        assert len(result["ranking"]) == 3
+
+    def test_parse_comparison_response_prose_preamble(self):
+        prose = (
+            "Here is my analysis of the candidates:\n\n"
+            + json.dumps(_VALID_COMPARISON_PAYLOAD)
+            + "\n\nLet me know if you need anything else."
+        )
+        result = parse_comparison_response(prose)
+        assert result["recommended_hire"] == "Alice Johnson"
+
+    # ── Response parser — error paths ─────────────────────────────────────────
+
+    def test_parse_comparison_response_invalid_raises(self):
+        with pytest.raises(ValueError, match="JSON"):
+            parse_comparison_response("not json at all !!! garbage text")
+
+    def test_parse_comparison_response_empty_raises(self):
+        with pytest.raises(ValueError, match="empty"):
+            parse_comparison_response("")
+
+    def test_parse_comparison_response_missing_key_raises(self):
+        payload = {k: v for k, v in _VALID_COMPARISON_PAYLOAD.items() if k != "ranking"}
+        with pytest.raises(ValueError, match="ranking"):
+            parse_comparison_response(json.dumps(payload))
+
+    def test_parse_comparison_response_duplicate_ranks_raises(self):
+        payload = {
+            **_VALID_COMPARISON_PAYLOAD,
+            "ranking": [
+                {**_VALID_COMPARISON_PAYLOAD["ranking"][0], "rank": 1},
+                {**_VALID_COMPARISON_PAYLOAD["ranking"][1], "rank": 1},  # duplicate
+                {**_VALID_COMPARISON_PAYLOAD["ranking"][2], "rank": 3},
+            ],
+        }
+        with pytest.raises(ValueError, match="rank"):
+            parse_comparison_response(json.dumps(payload))
+
+    def test_parse_comparison_response_last_place_not_null_raises(self):
+        payload = {
+            **_VALID_COMPARISON_PAYLOAD,
+            "ranking": [
+                {**_VALID_COMPARISON_PAYLOAD["ranking"][0]},
+                {**_VALID_COMPARISON_PAYLOAD["ranking"][1]},
+                # last place has beats_next_because set — should fail
+                {**_VALID_COMPARISON_PAYLOAD["ranking"][2], "beats_next_because": "Something"},
+            ],
+        }
+        with pytest.raises(ValueError, match="null"):
+            parse_comparison_response(json.dumps(payload))
+
+    def test_parse_comparison_response_recommended_hire_not_rank1_raises(self):
+        payload = {
+            **_VALID_COMPARISON_PAYLOAD,
+            "recommended_hire": "Bob Smith",  # rank-2 candidate
+        }
+        with pytest.raises(ValueError, match="rank-1"):
+            parse_comparison_response(json.dumps(payload))
+
+    # ── /compare endpoint — file-count validation ──────────────────────────────
+
+    @pytest.fixture(scope="class")
+    def client(self):
+        with TestClient(app) as c:
+            yield c
+
+    def test_compare_endpoint_requires_minimum_two_files(self, client):
+        """Sending a single PDF must return HTTP 422 before any LLM call."""
+        pdf_bytes = _make_pdf("Alice Johnson\nalice@example.com\nPython engineer.")
+        response = client.post(
+            "/compare",
+            data={"job_description": "Senior Python engineer with 5 years experience."},
+            files=[("pdf_files", ("alice.pdf", pdf_bytes, "application/pdf"))],
+        )
+        assert response.status_code == 422
+        assert "2" in response.json()["detail"]
+
+    def test_compare_endpoint_rejects_more_than_ten(self, client):
+        """Sending 11 PDFs must return HTTP 422 before parsing any file."""
+        pdf_bytes = _make_pdf("Candidate\ncandidate@example.com\nEngineer.")
+        eleven_files = [
+            ("pdf_files", (f"resume_{i}.pdf", pdf_bytes, "application/pdf"))
+            for i in range(11)
+        ]
+        response = client.post(
+            "/compare",
+            data={"job_description": "Senior Python engineer with 5 years experience."},
+            files=eleven_files,
+        )
+        assert response.status_code == 422
+        assert "10" in response.json()["detail"]
+
+    @patch("main.batch_screen", new_callable=AsyncMock)
+    @patch("main.run_comparison", new_callable=AsyncMock)
+    def test_compare_endpoint_success_with_mocks(
+        self, mock_run_comparison, mock_batch_screen, client
+    ):
+        """
+        Two valid PDFs + mocked backend calls → 200 with individual_results.
+        Verifies the endpoint wires up batch_screen and run_comparison correctly
+        without hitting any real API.
+        """
+        from models import ScreeningResult, BatchScreeningResult
+
+        alice = ScreeningResult(
+            candidate_name="Alice Johnson", score=9, recommendation="hire",
+            experience_match="strong",
+            strengths=["Python", "FastAPI", "Docker"],
+            gaps=["No ML", "Limited frontend", "No certs"],
+            summary="Alice is a strong fit.", raw_json={},
+        )
+        bob = ScreeningResult(
+            candidate_name="Bob Smith", score=5, recommendation="maybe",
+            experience_match="partial",
+            strengths=["Django", "SQL", "REST"],
+            gaps=["No k8s", "No Docker", "No CI/CD"],
+            summary="Bob is a partial fit.", raw_json={},
+        )
+        mock_batch_screen.return_value = BatchScreeningResult(
+            results=[alice, bob],
+            top_candidate="Alice Johnson",
+            total_screened=2,
+        )
+        mock_run_comparison.return_value = {
+            "recommended_hire": "Alice Johnson",
+            "job_description_summary": "Senior Python engineer.",
+            "ranking": [
+                {"rank": 1, "name": "Alice Johnson",
+                 "one_line_verdict": "Top candidate.", "beats_next_because": "FastAPI expertise"},
+                {"rank": 2, "name": "Bob Smith",
+                 "one_line_verdict": "Decent but gaps.", "beats_next_because": None},
+            ],
+            "panel_interview_shortlist": [],
+            "red_flags": {},
+            "hiring_memo": "Alice is the clear hire. Bob is a backup.",
+            "total_candidates": 2,
+        }
+
+        alice_pdf = _make_pdf("Alice Johnson\nalice@example.com\nPython FastAPI engineer.")
+        bob_pdf   = _make_pdf("Bob Smith\nbob@example.com\nDjango SQL developer.")
+
+        response = client.post(
+            "/compare",
+            data={"job_description": "Senior Python engineer with 5 years experience."},
+            files=[
+                ("pdf_files", ("alice.pdf", alice_pdf, "application/pdf")),
+                ("pdf_files", ("bob.pdf",   bob_pdf,   "application/pdf")),
+            ],
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert len(body["individual_results"]) == 2
+        assert body["comparison"]["recommended_hire"] == "Alice Johnson"
+        assert mock_batch_screen.called
+        assert mock_run_comparison.called
