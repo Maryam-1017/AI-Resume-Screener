@@ -1,86 +1,189 @@
 @import "tailwindcss";
 
+/* ═══════════════════════════════════════════════════════════
+   CSS VARIABLES — Dark (default) / Light (html.light)
+═══════════════════════════════════════════════════════════ */
+
+:root {
+  /* Backgrounds */
+  --c-bg:           linear-gradient(160deg,#0F0F1A 0%,#1A0F2E 100%);
+  --c-header:       rgba(15,10,30,0.85);
+  --c-header-border:rgba(139,92,246,0.12);
+
+  /* Card surfaces */
+  --c-card:         rgba(255,255,255,0.03);
+  --c-card-strong:  rgba(255,255,255,0.05);
+  --c-card-border:  rgba(255,255,255,0.08);
+  --c-card-border2: rgba(255,255,255,0.1);
+  --c-surface:      rgba(255,255,255,0.06);
+  --c-surface-alt:  rgba(255,255,255,0.02);
+
+  /* Text scale */
+  --c-t1:    #f1f5f9;
+  --c-t2:    rgba(255,255,255,0.75);
+  --c-t3:    rgba(255,255,255,0.5);
+  --c-t4:    rgba(255,255,255,0.35);
+  --c-t5:    rgba(255,255,255,0.22);
+  --c-tbody: rgba(255,255,255,0.72);
+  --c-titem: rgba(255,255,255,0.82);
+  --c-label: rgba(196,181,253,0.5);
+
+  /* Inputs */
+  --c-input-bg:     #0D0D1A;
+  --c-input-border: rgba(139,92,246,0.2);
+
+  /* Miscellaneous */
+  --c-footer-border: rgba(139,92,246,0.10);
+  --c-grid:          rgba(139,92,246,0.04);
+  --c-scrollbar:     rgba(139,92,246,0.35);
+  --c-divider:       rgba(255,255,255,0.15);
+
+  /* Back button */
+  --c-back-bg:      rgba(139,92,246,0.10);
+  --c-back-text:    rgba(196,181,253,0.70);
+  --c-back-border:  rgba(139,92,246,0.25);
+
+  /* Ranking rows */
+  --c-rank-first:  rgba(16,185,129,0.07);
+  --c-rank-alt:    rgba(255,255,255,0.02);
+  --c-rank-border: rgba(255,255,255,0.05);
+
+  /* Expand drawer */
+  --c-expand-bg:    rgba(139,92,246,0.06);
+  --c-expand-border:rgba(139,92,246,0.15);
+  --c-expand-label: rgba(255,255,255,0.35);
+  --c-expand-text:  rgba(165,180,252,0.90);
+}
+
+html.light {
+  --c-bg:           linear-gradient(160deg,#F9F8FF 0%,#EFF0FF 100%);
+  --c-header:       rgba(249,248,255,0.88);
+  --c-header-border:rgba(139,92,246,0.14);
+
+  --c-card:         rgba(255,255,255,0.78);
+  --c-card-strong:  rgba(255,255,255,0.92);
+  --c-card-border:  rgba(139,92,246,0.14);
+  --c-card-border2: rgba(139,92,246,0.18);
+  --c-surface:      rgba(139,92,246,0.06);
+  --c-surface-alt:  rgba(139,92,246,0.03);
+
+  --c-t1:    #1e1b4b;
+  --c-t2:    rgba(30,27,75,0.78);
+  --c-t3:    rgba(30,27,75,0.55);
+  --c-t4:    rgba(30,27,75,0.40);
+  --c-t5:    rgba(30,27,75,0.28);
+  --c-tbody: rgba(30,27,75,0.72);
+  --c-titem: rgba(30,27,75,0.85);
+  --c-label: rgba(109,40,217,0.55);
+
+  --c-input-bg:     #ffffff;
+  --c-input-border: rgba(139,92,246,0.22);
+
+  --c-footer-border: rgba(139,92,246,0.12);
+  --c-grid:          rgba(139,92,246,0.06);
+  --c-scrollbar:     rgba(139,92,246,0.40);
+  --c-divider:       rgba(139,92,246,0.18);
+
+  --c-back-bg:     rgba(139,92,246,0.08);
+  --c-back-text:   rgba(109,40,217,0.70);
+  --c-back-border: rgba(139,92,246,0.22);
+
+  --c-rank-first:  rgba(16,185,129,0.09);
+  --c-rank-alt:    rgba(139,92,246,0.03);
+  --c-rank-border: rgba(139,92,246,0.07);
+
+  --c-expand-bg:     rgba(139,92,246,0.05);
+  --c-expand-border: rgba(139,92,246,0.12);
+  --c-expand-label:  rgba(30,27,75,0.40);
+  --c-expand-text:   rgba(109,40,217,0.85);
+}
+
+/* ── Base ───────────────────────────────────────── */
 html, body {
-  background: linear-gradient(160deg, #0F0F1A 0%, #1A0F2E 100%) !important;
+  background: var(--c-bg) !important;
   background-attachment: fixed !important;
-  color: #f1f5f9;
+  color: var(--c-t1);
   min-height: 100%;
+  transition: background 0.35s ease, color 0.2s ease;
 }
 
 * { box-sizing: border-box; }
 
 ::-webkit-scrollbar { width: 4px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: rgba(139,92,246,0.35); border-radius: 4px; }
+::-webkit-scrollbar-thumb { background: var(--c-scrollbar); border-radius: 4px; }
 
-/* ── Glassmorphism ─────────────────────────────── */
+/* ── Glassmorphism ──────────────────────────────── */
 .glass {
-  background: rgba(255,255,255,0.03);
+  background: var(--c-card);
   backdrop-filter: blur(20px);
   -webkit-backdrop-filter: blur(20px);
-  border: 1px solid rgba(255,255,255,0.08);
+  border: 1px solid var(--c-card-border);
   border-radius: 24px;
+  transition: background 0.3s ease, border-color 0.3s ease;
 }
 
 .glass-strong {
-  background: rgba(255,255,255,0.05);
+  background: var(--c-card-strong);
   backdrop-filter: blur(24px);
   -webkit-backdrop-filter: blur(24px);
-  border: 1px solid rgba(255,255,255,0.1);
+  border: 1px solid var(--c-card-border2);
   border-radius: 24px;
+  transition: background 0.3s ease, border-color 0.3s ease;
 }
 
-/* ── Gradient text ─────────────────────────────── */
+/* ── Gradient text ──────────────────────────────── */
 .gradient-text {
-  background: linear-gradient(135deg, #818cf8 0%, #a78bfa 50%, #22d3ee 100%);
+  background: linear-gradient(135deg,#818cf8 0%,#a78bfa 50%,#22d3ee 100%);
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
   background-clip: text;
 }
 
 .gradient-text-hero {
-  background: linear-gradient(135deg, #8B5CF6 20%, #06B6D4 80%);
+  background: linear-gradient(135deg,#8B5CF6 20%,#06B6D4 80%);
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
   background-clip: text;
 }
 
-/* ── Glow helpers ──────────────────────────────── */
+/* ── Glow helpers ───────────────────────────────── */
 .glow-emerald { filter: drop-shadow(0 0 20px rgba(16,185,129,0.5)); }
 .glow-amber   { filter: drop-shadow(0 0 20px rgba(245,158,11,0.5)); }
 .glow-red     { filter: drop-shadow(0 0 20px rgba(239,68,68,0.5)); }
 
-/* ── 3D tilt ───────────────────────────────────── */
+/* ── 3D tilt ────────────────────────────────────── */
 .tilt-card { transform-style: preserve-3d; will-change: transform; }
 
-/* ── Button shimmer ────────────────────────────── */
+/* ── Button shimmer ─────────────────────────────── */
 @keyframes btn-shimmer {
   0%   { transform: translateX(-100%) skewX(-20deg); }
   100% { transform: translateX(250%)  skewX(-20deg); }
 }
 
-.btn-shimmer-wrap {
-  position: relative;
-  overflow: hidden;
-}
+.btn-shimmer-wrap { position: relative; overflow: hidden; }
 
 .btn-shimmer-wrap::after {
   content: '';
   position: absolute;
   inset: 0;
-  background: linear-gradient(
-    90deg,
-    transparent 0%,
-    rgba(255,255,255,0.18) 50%,
-    transparent 100%
-  );
+  background: linear-gradient(90deg,transparent 0%,rgba(255,255,255,0.18) 50%,transparent 100%);
   animation: btn-shimmer 2.8s ease-in-out infinite;
   pointer-events: none;
 }
 
-/* ── Stats counter divider ─────────────────────── */
+/* ── Stats divider ──────────────────────────────── */
 .stat-divider {
   width: 1px;
   height: 32px;
-  background: linear-gradient(to bottom, transparent, rgba(255,255,255,0.15), transparent);
+  background: linear-gradient(to bottom,transparent,var(--c-divider),transparent);
 }
+
+/* ── Theme toggle button ────────────────────────── */
+.theme-toggle {
+  transition: background 0.25s ease, border-color 0.25s ease, transform 0.2s ease;
+}
+.theme-toggle:hover { transform: scale(1.1); }
+
+/* ── Nav transition ─────────────────────────────── */
+nav, header { transition: background 0.3s ease, border-color 0.3s ease; }
